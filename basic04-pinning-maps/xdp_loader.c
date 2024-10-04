@@ -23,6 +23,7 @@ static const char *__doc__ = "XDP loader\n"
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
 #include "common_kern_user.h"
+#include <sys/stat.h>
 
 static const char *default_filename = "xdp_prog_kern.o";
 
@@ -71,45 +72,66 @@ const char *map_name    =  "xdp_stats_map";
 /* Pinning maps under /sys/fs/bpf in subdir */
 int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir)
 {
-	char map_filename[PATH_MAX];
-	char pin_dir[PATH_MAX];
-	int err, len;
+    char map_filename[PATH_MAX];
+    char pin_dir[PATH_MAX];
+    int err, len;
+    int fd;
 
-	len = snprintf(pin_dir, PATH_MAX, "%s/%s", pin_basedir, subdir);
-	if (len < 0) {
-		fprintf(stderr, "ERR: creating pin dirname\n");
-		return EXIT_FAIL_OPTION;
-	}
+    // Construct the pin directory path
+    len = snprintf(pin_dir, PATH_MAX, "%s/%s", pin_basedir, subdir);
+    if (len < 0) {
+        fprintf(stderr, "ERR: creating pin dirname\n");
+        return EXIT_FAIL_OPTION;
+    }
 
-	len = snprintf(map_filename, PATH_MAX, "%s/%s/%s",
-		       pin_basedir, subdir, map_name);
-	if (len < 0) {
-		fprintf(stderr, "ERR: creating map_name\n");
-		return EXIT_FAIL_OPTION;
-	}
+    // Construct the full path for the pinned map
+    len = snprintf(map_filename, PATH_MAX, "%s/%s/%s", pin_basedir, subdir, map_name);
+    if (len < 0) {
+        fprintf(stderr, "ERR: creating map_name\n");
+        return EXIT_FAIL_OPTION;
+    }
 
-	/* Existing/previous XDP prog might not have cleaned up */
-	if (access(map_filename, F_OK ) != -1 ) {
-		if (verbose)
-			printf(" - Unpinning (remove) prev maps in %s/\n",
-			       pin_dir);
+    // Check if the pinned map exists
+    if (access(map_filename, F_OK) != -1) {
+        if (verbose) {
+            printf(" - Reusing pinned map at: %s\n", map_filename);
+        }
 
-		/* Basically calls unlink(3) on map_filename */
-		err = bpf_object__unpin_maps(bpf_obj, pin_dir);
-		if (err) {
-			fprintf(stderr, "ERR: UNpinning maps in %s\n", pin_dir);
-			return EXIT_FAIL_BPF;
-		}
-	}
-	if (verbose)
-		printf(" - Pinning maps in %s/\n", pin_dir);
+        // Get the file descriptor for the existing map
+        fd = bpf_obj_get(map_filename);
+        if (fd < 0) {
+            fprintf(stderr, "ERR: Failed to get pinned map at %s\n", map_filename);
+            return EXIT_FAIL_BPF;
+        }
 
-	/* This will pin all maps in our bpf_object */
-	err = bpf_object__pin_maps(bpf_obj, pin_dir);
-	if (err)
-		return EXIT_FAIL_BPF;
+        // Reuse the pinned map with the existing map
+        struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, map_name);
+        if (!map) {
+            fprintf(stderr, "ERR: Could not find map in object: %s\n", map_name);
+            close(fd);
+            return EXIT_FAIL_BPF;
+        }
 
-	return 0;
+        err = bpf_map__reuse_fd(map, fd);
+        if (err) {
+            fprintf(stderr, "ERR: Reusing pinned map failed\n");
+            close(fd);
+            return EXIT_FAIL_BPF;
+        }
+        close(fd);
+
+    } else {
+        if (verbose) {
+            printf(" - Pinning new maps in %s/\n", pin_dir);
+        }
+        err = bpf_object__pin_maps(bpf_obj, pin_dir);
+        if (err) {
+            fprintf(stderr, "ERR: Pinning maps failed\n");
+            return EXIT_FAIL_BPF;
+        }
+    }
+
+    return 0;
 }
 
 int main(int argc, char **argv)
