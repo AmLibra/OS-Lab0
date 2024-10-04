@@ -16,30 +16,44 @@
  */
 static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
 {
-	/*
 	void *data_end = (void *)(long)ctx->data_end;
 	struct ethhdr eth_cpy;
 	struct vlan_hdr *vlh;
 	__be16 h_proto;
-	*/
-	int vlid = -1;
+	int vlid;
 
-	/* Check if there is a vlan tag to pop */
+	if (!proto_is_vlan(eth->h_proto))
+		return -1;
+
+	/* Careful with the parenthesis here */
+	vlh = (void *)(eth + 1);
 
 	/* Still need to do bounds checking */
+	if (vlh + 1 > data_end)
+		return -1;
 
 	/* Save vlan ID for returning, h_proto for updating Ethernet header */
+	vlid = bpf_ntohs(vlh->h_vlan_TCI);
+	h_proto = vlh->h_vlan_encapsulated_proto;
 
 	/* Make a copy of the outer Ethernet header before we cut it off */
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
 
 	/* Actually adjust the head pointer */
+	if (bpf_xdp_adjust_head(ctx, (int)sizeof(*vlh)))
+		return -1;
 
 	/* Need to re-evaluate data *and* data_end and do new bounds checking
 	 * after adjusting head
 	 */
+	eth = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	if (eth + 1 > data_end)
+		return -1;
 
 	/* Copy back the old Ethernet header and update the proto type */
-
+	__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+	eth->h_proto = h_proto;
 
 	return vlid;
 }
@@ -48,8 +62,43 @@ static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
  * -1 on failure.
  */
 static __always_inline int vlan_tag_push(struct xdp_md *ctx,
-					 struct ethhdr *eth, int vlid)
+		struct ethhdr *eth, int vlid)
 {
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr eth_cpy;
+	struct vlan_hdr *vlh;
+
+	/* First copy the original Ethernet header */
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
+
+	/* Then add space in front of the packet */
+	if (bpf_xdp_adjust_head(ctx, 0 - (int)sizeof(*vlh)))
+		return -1;
+
+	/* Need to re-evaluate data_end and data after head adjustment, and
+	 * bounds check, even though we know there is enough space (as we
+	 * increased it).
+	 */
+	data_end = (void *)(long)ctx->data_end;
+	eth = (void *)(long)ctx->data;
+
+	if (eth + 1 > data_end)
+		return -1;
+
+	/* Copy back Ethernet header in the right place, populate VLAN tag with
+	 * ID and proto, and set outer Ethernet header to VLAN type.
+	 */
+	__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+
+	vlh = (void *)(eth + 1);
+
+	if (vlh + 1 > data_end)
+		return -1;
+
+	vlh->h_vlan_TCI = bpf_htons(vlid);
+	vlh->h_vlan_encapsulated_proto = eth->h_proto;
+
+	eth->h_proto = bpf_htons(ETH_P_8021Q);
 	return 0;
 }
 
@@ -57,7 +106,109 @@ static __always_inline int vlan_tag_push(struct xdp_md *ctx,
 SEC("xdp")
 int xdp_port_rewrite_func(struct xdp_md *ctx)
 {
-	return XDP_PASS;
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct hdr_cursor nh;
+    int nh_type;
+    nh.pos = data;
+
+    struct ethhdr *eth;
+    struct iphdr *iph;
+    struct ipv6hdr *ip6h;
+    struct tcphdr *tcph;
+    struct udphdr *udph;
+
+    // Parse Ethernet header
+    nh_type = parse_ethhdr(&nh, data_end, &eth);
+    
+    if (nh_type == bpf_htons(ETH_P_IP)) {
+        nh_type = parse_iphdr(&nh, data_end, &iph);
+        if (nh_type == IPPROTO_TCP) {
+            // Parse TCP header and check bounds
+            if ((void *)(nh.pos + sizeof(struct tcphdr)) > data_end) {
+                return XDP_PASS;  // Bounds check failed, pass the packet
+            }
+
+            tcph = nh.pos;
+            __u16 old_dest_port = bpf_ntohs(tcph->dest);
+            __u16 new_dest_port = old_dest_port - 1;
+            tcph->dest = bpf_htons(new_dest_port);
+
+            // Update checksum for TCP
+            __u32 old_check = tcph->check;
+            __u32 csum = bpf_csum_diff((__be32 *)&old_dest_port, sizeof(old_dest_port),
+                                       (__be32 *)&new_dest_port, sizeof(new_dest_port), old_check);
+            tcph->check = ~csum;
+
+            bpf_printk("Rewrote TCP dest port from %d to %d\n", old_dest_port, new_dest_port);
+
+        } else if (nh_type == IPPROTO_UDP) {
+            // Parse UDP header and check bounds
+            if ((void *)(nh.pos + sizeof(struct udphdr)) > data_end) {
+                return XDP_PASS;  // Bounds check failed, pass the packet
+            }
+
+            udph = nh.pos;
+            __u16 old_dest_port = bpf_ntohs(udph->dest);
+            __u16 new_dest_port = old_dest_port - 1;
+            udph->dest = bpf_htons(new_dest_port);
+
+            // Update checksum for UDP
+            if (udph->check) {  // Update checksum only if it's non-zero
+                __u32 old_check = udph->check;
+                __u32 csum = bpf_csum_diff((__be32 *)&old_dest_port, sizeof(old_dest_port),
+                                           (__be32 *)&new_dest_port, sizeof(new_dest_port), old_check);
+                udph->check = ~csum;
+            }
+
+            bpf_printk("Rewrote UDP dest port from %d to %d\n", old_dest_port, new_dest_port);
+        }
+    } else if (nh_type == bpf_htons(ETH_P_IPV6)) {
+        nh_type = parse_ip6hdr(&nh, data_end, &ip6h);
+        if (nh_type == IPPROTO_TCP) {
+            // Parse TCP header and check bounds
+            if ((void *)(nh.pos + sizeof(struct tcphdr)) > data_end) {
+                return XDP_PASS;  // Bounds check failed, pass the packet
+            }
+
+            tcph = nh.pos;
+            __u16 old_dest_port = bpf_ntohs(tcph->dest);
+            __u16 new_dest_port = old_dest_port - 1;
+            tcph->dest = bpf_htons(new_dest_port);
+
+            // Update checksum for TCP over IPv6
+            __u32 old_check = tcph->check;
+            __u32 csum = bpf_csum_diff((__be32 *)&old_dest_port, sizeof(old_dest_port),
+                                       (__be32 *)&new_dest_port, sizeof(new_dest_port), old_check);
+            tcph->check = ~csum;
+
+            bpf_printk("Rewrote TCP dest port from %d to %d (IPv6)\n", old_dest_port, new_dest_port);
+
+        } else if (nh_type == IPPROTO_UDP) {
+            // Parse UDP header and check bounds
+            if ((void *)(nh.pos + sizeof(struct udphdr)) > data_end) {
+                return XDP_PASS;  // Bounds check failed, pass the packet
+            }
+
+            udph = nh.pos;
+            __u16 old_dest_port = bpf_ntohs(udph->dest);
+            __u16 new_dest_port = old_dest_port - 1;
+            udph->dest = bpf_htons(new_dest_port);
+
+            // Update checksum for UDP over IPv6
+            if (udph->check) {  // Update checksum only if it's non-zero
+                __u32 old_check = udph->check;
+                __u32 csum = bpf_csum_diff((__be32 *)&old_dest_port, sizeof(old_dest_port),
+                                           (__be32 *)&new_dest_port, sizeof(new_dest_port), old_check);
+                udph->check = ~csum;
+            }
+
+            bpf_printk("Rewrote UDP dest port from %d to %d (IPv6)\n", old_dest_port, new_dest_port);
+        }
+    }
+
+    return XDP_PASS;
 }
 
 /* VLAN swapper; will pop outermost VLAN tag if it exists, otherwise push a new
@@ -79,11 +230,17 @@ int xdp_vlan_swap_func(struct xdp_md *ctx)
 	if (nh_type < 0)
 		return XDP_PASS;
 
-	/* Assignment 2 and 3 will implement these. For now they do nothing */
-	if (proto_is_vlan(eth->h_proto))
-		vlan_tag_pop(ctx, eth);
-	else
-		vlan_tag_push(ctx, eth, 1);
+	 if (proto_is_vlan(eth->h_proto)) {
+        if (vlan_tag_pop(ctx, eth) < 0) {
+			bpf_printk("Packet aborted due to failed VLAN operation.\n");
+            return XDP_ABORTED; // Abort if VLAN tag pop fails
+        }
+    } else {
+        if (vlan_tag_push(ctx, eth, 1) < 0) {
+			bpf_printk("Packet aborted due to failed VLAN operation.\n");
+            return XDP_ABORTED; // Abort if VLAN tag push fails
+        }
+    }
 
 	return XDP_PASS;
 }
