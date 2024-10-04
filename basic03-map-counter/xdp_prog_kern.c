@@ -25,8 +25,8 @@ struct {
 SEC("xdp")
 int  xdp_stats1_func(struct xdp_md *ctx)
 {
-	// void *data_end = (void *)(long)ctx->data_end;
-	// void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data     = (void *)(long)ctx->data;
 	struct datarec *rec;
 	__u32 key = XDP_PASS; /* XDP_PASS = 2 */
 
@@ -42,13 +42,15 @@ int  xdp_stats1_func(struct xdp_md *ctx)
 	/* Multiple CPUs can access data record. Thus, the accounting needs to
 	 * use an atomic operation.
 	 */
-	lock_xadd(&rec->rx_packets, 1);
-        /* Assignment#1: Add byte counters
-         * - Hint look at struct xdp_md *ctx (copied below)
-         *
-         * Assignment#3: Avoid the atomic operation
-         * - Hint there is a map type named BPF_MAP_TYPE_PERCPU_ARRAY
-         */
+	
+	/* Calculate packet length */
+	__u64 bytes = data_end - data;
+	/* BPF_MAP_TYPE_PERCPU_ARRAY returns a data record specific to current
+	* CPU and XDP hooks runs under Softirq, which makes it safe to update
+	* without atomic operations.
+	*/
+	rec->rx_packets++;
+	rec->rx_bytes += bytes;
 
 	return XDP_PASS;
 }
